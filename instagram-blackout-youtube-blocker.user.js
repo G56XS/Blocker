@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Instagram Blackout (Feed/Explore/Reels) + YouTube Shorts & Comments Blocker
 // @namespace    https://tampermonkey.net/
-// @version      6.0
+// @version      6.1
 // @description  Instantly blacks out Instagram's home feed, Explore grid, and Reels tab on load (no flash of content). Only accounts on your allow-list show. Search results, profile pages, and DMs are untouched. Also blocks all YouTube Shorts and comments, with its own on/off toggle. A settings panel lets you choose to block everything, comments only, YouTube Shorts only, or Instagram only. Join my discord : https://discord.gg/TKT66C7Gu7
 // @author       Lvens
 // @match        https://www.instagram.com/*
@@ -33,6 +33,27 @@
 //   rows each contain a username link + a <time datetime>) in addition to
 //   the known obfuscated class hooks, so it keeps working if Instagram
 //   rotates those class names again.
+//
+// v6.1 — fixes reported double-overlay text and the carousel-arrow
+// becoming unclickable even after turning blocking off:
+// - The reel/post-link scan could independently black out a wrapper
+//   nested inside an <article> the article-level scan had already
+//   blacked out, stacking two overlays on top of each other (the garbled
+//   overlapping "Blocked — @user" text + duplicated buttons). Now skips
+//   any node whose ancestor is already blacked out, and cleans up any
+//   now-redundant nested blackout boxes when a node is newly blocked.
+// - unblockNode() used to remove only the FIRST overlay div it found. If
+//   a node ever ended up with two stacked overlays, only one got cleaned
+//   up, leaving an invisible, full-size, extremely-high-z-index div
+//   behind that silently intercepted clicks (e.g. the next-photo arrow on
+//   a carousel post) even with nothing visibly "blocked" anymore. It now
+//   removes every overlay descendant, plus a global safety sweep runs
+//   whenever blackout is off.
+// - Dropped the guessed "load more comments" / "view replies" selectors
+//   (._abl-, ._aswp) — these were unverified and may have been matching
+//   the wrong element (e.g. a carousel control) instead of a comments
+//   button. Comment hiding now relies on the exact comment-list selector
+//   plus the structural fallback only.
 
 (function () {
   'use strict';
@@ -440,16 +461,42 @@
 
     function unblockNode(node) {
       node.classList.remove('ff-blocked');
-      const overlay = node.querySelector('.ff-overlay');
-      if (overlay) overlay.remove();
+      // FIX: this used to remove only the FIRST overlay via querySelector.
+      // If a node ever ended up with more than one overlay stacked on it
+      // (see the nested-blocking bug below), only one would get cleaned
+      // up — leaving an invisible, full-size, extremely-high-z-index div
+      // behind that silently ate clicks (e.g. on the carousel's next-photo
+      // arrow) even after the visible "Blocked" box was gone. Removing
+      // every .ff-overlay descendant guarantees nothing is left behind.
+      node.querySelectorAll('.ff-overlay').forEach(o => o.remove());
+    }
+
+    function alreadyBlockedAncestor(node) {
+      let el = node.parentElement;
+      while (el) {
+        if (el.classList.contains('ff-blocked')) return true;
+        el = el.parentElement;
+      }
+      return false;
     }
 
     function processNode(node) {
+      // FIX: previously, an <article> could get blacked out by the main
+      // article scan AND a nested wrapper inside that same article could
+      // independently get blacked out by the reel/post-link scan (or the
+      // video scan), stacking two overlays on top of each other — the
+      // garbled double "Blocked — @user" text and duplicated "Always show
+      // this account" buttons. Skip processing anything whose ancestor is
+      // already blacked out (nothing more to cover), and if this node is
+      // about to be newly blocked, clean up any now-redundant nested
+      // blackout boxes inside it.
+      if (alreadyBlockedAncestor(node)) return;
       const username = extractUsername(node);
       if (username && allowList.has(username)) {
         unblockNode(node);
       } else {
         blockNode(node, username);
+        node.querySelectorAll('.ff-blocked').forEach(el => { if (el !== node) unblockNode(el); });
       }
       node.dataset.ffChecked = '1';
     }
@@ -492,6 +539,10 @@
     function scan() {
       if (!feedActive() || !isBlackoutPage()) {
         document.querySelectorAll('.ff-blocked').forEach(unblockNode);
+        // Belt-and-suspenders: guarantee no orphaned overlay div is left
+        // sitting on top of the page (invisible but still capturing
+        // clicks) no matter how it got there.
+        document.querySelectorAll('.ff-overlay').forEach(o => o.remove());
       } else {
         document.querySelectorAll('article').forEach(processNode);
         document.querySelectorAll('a[href^="/reel/"], a[href^="/p/"]').forEach(a => {
@@ -514,8 +565,13 @@
     // not just the feed/explore/reels blackout pages — so this runs on every
     // IG page and is gated only by the same master `enabled` toggle.
     const COMMENT_LIST_SELECTOR = 'ul._a9ym';
-    const LOAD_MORE_COMMENTS_SELECTOR = '._abl-';
-    const VIEW_REPLIES_SELECTOR = '._aswp';
+    // NOTE: previous "load more comments" / "view replies" selectors
+    // (._abl-, ._aswp) were unverified guesses at Instagram's obfuscated
+    // class names. There's a real chance they were actually matching
+    // something else entirely — e.g. a carousel navigation control —
+    // which would explain posts becoming unclickable. Dropped in favor of
+    // the exact comment-list selector above plus the structural fallback
+    // below, both of which are much less likely to hit the wrong element.
 
     // Structural fallback: a comment list is a <ul> whose <li> rows each
     // contain a username link plus a <time datetime> timestamp. That
@@ -538,14 +594,6 @@
         return;
       }
       document.querySelectorAll(COMMENT_LIST_SELECTOR).forEach(el => el.classList.add('ff-comment-hidden'));
-      document.querySelectorAll(LOAD_MORE_COMMENTS_SELECTOR).forEach(btn => {
-        const li = btn.closest('li') || btn;
-        li.classList.add('ff-comment-hidden');
-      });
-      document.querySelectorAll(VIEW_REPLIES_SELECTOR).forEach(btn => {
-        const li = btn.closest('li') || btn;
-        li.classList.add('ff-comment-hidden');
-      });
       document.querySelectorAll('ul').forEach(ul => {
         if (looksLikeCommentList(ul)) ul.classList.add('ff-comment-hidden');
       });

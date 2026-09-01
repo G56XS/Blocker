@@ -2,7 +2,7 @@
 // @name         Instagram Blackout (Feed/Explore/Reels) + YouTube Shorts & Comments Blocker
 // @namespace    https://tampermonkey.net/
 // @version      4.2
-// @description  Instantly blacks out Instagram's home feed, Explore grid, and Reels tab on load (no flash of content). Only accounts on your allow-list show. Search results, profile pages, and DMs are untouched. Also blocks all YouTube Shorts and comments, with its own on/off toggle. A settings panel lets you choose to block everything, comments only, YouTube Shorts only, or Instagram only. Join my discord : https://discord.gg/TKT66C7Gu7
+// @description  Blocks Youtube Shorts, and Instagram Reels, also blocks Comments (for your peace of mind). With some customizable settings. Join my discord : https://discord.gg/TKT66C7Gu7
 // @author       Lvens
 // @match        https://www.instagram.com/*
 // @match        https://www.youtube.com/*

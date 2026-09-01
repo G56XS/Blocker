@@ -1,14 +1,15 @@
 // ==UserScript==
 // @name         Instagram Blackout (Feed/Explore/Reels) + YouTube Shorts & Comments Blocker
 // @namespace    https://tampermonkey.net/
-// @version      4.0
-// @description  Instantly blacks out Instagram's home feed, Explore grid, and Reels tab on load (no flash of content). Only accounts on your allow-list show. Search results, profile pages, and DMs are untouched. Also blocks all YouTube Shorts and comments, with its own on/off toggle. Join my discord : https://discord.gg/TKT66C7Gu7
+// @version      4.2
+// @description  Instantly blacks out Instagram's home feed, Explore grid, and Reels tab on load (no flash of content). Only accounts on your allow-list show. Search results, profile pages, and DMs are untouched. Also blocks all YouTube Shorts and comments, with its own on/off toggle. A settings panel lets you choose to block everything, comments only, YouTube Shorts only, or Instagram only. Join my discord : https://discord.gg/TKT66C7Gu7
 // @author       Lvens
 // @match        https://www.instagram.com/*
 // @match        https://www.youtube.com/*
 // @grant        GM_addStyle
 // @grant        GM_setValue
 // @grant        GM_getValue
+// @grant        GM_addValueChangeListener
 // @run-at       document-start
 // ==/UserScript==
 
@@ -17,6 +18,168 @@
 
   const isIG = location.hostname.includes('instagram.com');
   const isYT = location.hostname.includes('youtube.com');
+
+  // Simple debounce with a max wait, so continuous mutations (infinite
+  // scroll, etc.) can't starve the scan indefinitely.
+  function makeDebouncer(fn, wait, maxWait) {
+    let timer = null;
+    let firstCallAt = null;
+    return function debounced() {
+      const now = Date.now();
+      if (firstCallAt === null) firstCallAt = now;
+      clearTimeout(timer);
+      if (now - firstCallAt >= maxWait) {
+        firstCallAt = null;
+        fn();
+        return;
+      }
+      timer = setTimeout(() => {
+        firstCallAt = null;
+        fn();
+      }, wait);
+    };
+  }
+
+  /* ===========================================================
+     SHARED: what-to-block mode
+     (Storage is shared by the script across both matched domains,
+     so the mode you pick on one site is remembered on the other.)
+  =========================================================== */
+  const MODE_KEY = 'ff_block_mode'; // 'all' | 'comments' | 'yt_shorts' | 'instagram'
+
+  const BLOCK_MODES = [
+    { id: 'all', label: 'Block all', hint: 'Feed/Explore/Reels, Shorts, and comments everywhere' },
+    { id: 'comments', label: 'Comments only', hint: 'Hide comments on Instagram and YouTube; leave feeds/Shorts alone' },
+    { id: 'yt_shorts', label: 'YouTube Shorts only', hint: 'Instagram and YouTube comments stay visible' },
+    { id: 'instagram', label: 'Instagram only', hint: 'Feed/Explore/Reels + IG comments; YouTube untouched' },
+  ];
+
+  function computeModeFlags(mode) {
+    switch (mode) {
+      case 'comments':
+        return { igFeed: false, igComments: true, ytShorts: false, ytComments: true };
+      case 'yt_shorts':
+        return { igFeed: false, igComments: false, ytShorts: true, ytComments: false };
+      case 'instagram':
+        return { igFeed: true, igComments: true, ytShorts: false, ytComments: false };
+      case 'all':
+      default:
+        return { igFeed: true, igComments: true, ytShorts: true, ytComments: true };
+    }
+  }
+
+  GM_addStyle(`
+    #ff-gear, #yt-gear {
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      background: #111;
+      color: #fff;
+      border: 1px solid #333;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      font-size: 13px;
+      box-shadow: 0 2px 8px rgba(0,0,0,.5);
+      flex-shrink: 0;
+    }
+    #global-settings-panel {
+      position: fixed;
+      bottom: 60px;
+      right: 20px;
+      z-index: 2147483001;
+      background: #111;
+      color: #fff;
+      border-radius: 12px;
+      padding: 12px 14px;
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      font-size: 12px;
+      box-shadow: 0 2px 8px rgba(0,0,0,.5);
+      border: 1px solid #333;
+      min-width: 230px;
+    }
+    #global-settings-panel .gs-title {
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+    #global-settings-panel .gs-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      padding: 6px 0;
+      cursor: pointer;
+    }
+    #global-settings-panel .gs-row input {
+      margin-top: 3px;
+      flex-shrink: 0;
+    }
+    #global-settings-panel .gs-label {
+      font-weight: 600;
+    }
+    #global-settings-panel .gs-hint {
+      opacity: .6;
+      font-size: 10px;
+      margin-top: 1px;
+    }
+  `);
+
+  // Generic mode-picker panel, shared by both the Instagram and YouTube
+  // gear buttons (only one of which exists on any given page).
+  function buildSettingsPanel({ currentMode, onChange }) {
+    const existing = document.getElementById('global-settings-panel');
+    if (existing) { existing.remove(); return; }
+
+    const panelEl = document.createElement('div');
+    panelEl.id = 'global-settings-panel';
+
+    const title = document.createElement('div');
+    title.className = 'gs-title';
+    title.textContent = 'What should I block?';
+    panelEl.appendChild(title);
+
+    BLOCK_MODES.forEach(({ id, label, hint }) => {
+      const row = document.createElement('label');
+      row.className = 'gs-row';
+
+      const radio = document.createElement('input');
+      radio.type = 'radio';
+      radio.name = 'ff-block-mode';
+      radio.value = id;
+      radio.checked = currentMode === id;
+      radio.addEventListener('change', () => {
+        if (radio.checked) {
+          onChange(id);
+          panelEl.remove();
+        }
+      });
+
+      const textWrap = document.createElement('div');
+      const strong = document.createElement('div');
+      strong.className = 'gs-label';
+      strong.textContent = label;
+      const small = document.createElement('div');
+      small.className = 'gs-hint';
+      small.textContent = hint;
+      textWrap.appendChild(strong);
+      textWrap.appendChild(small);
+
+      row.appendChild(radio);
+      row.appendChild(textWrap);
+      panelEl.appendChild(row);
+    });
+
+    document.body.appendChild(panelEl);
+
+    setTimeout(() => {
+      document.addEventListener('click', function onDocClick(e) {
+        if (!panelEl.contains(e.target) && !e.target.closest('#ff-gear, #yt-gear')) {
+          panelEl.remove();
+          document.removeEventListener('click', onDocClick);
+        }
+      });
+    }, 0);
+  }
 
   /* ===========================================================
      INSTAGRAM
@@ -27,9 +190,13 @@
 
     let allowList = new Set(GM_getValue(LIST_KEY, []));
     let enabled = GM_getValue(ENABLED_KEY, true);
+    let blockMode = GM_getValue(MODE_KEY, 'all');
+    let modeFlags = computeModeFlags(blockMode);
 
     function saveList() { GM_setValue(LIST_KEY, [...allowList]); }
     function saveEnabled() { GM_setValue(ENABLED_KEY, enabled); }
+    function feedActive() { return enabled && modeFlags.igFeed; }
+    function commentsActive() { return enabled && modeFlags.igComments; }
 
     function isBlackoutPage() {
       const p = location.pathname;
@@ -88,10 +255,6 @@
       .ff-overlay button:hover { background: #3a3a3a; }
 
       #ff-panel {
-        position: fixed;
-        bottom: 20px;
-        right: 20px;
-        z-index: 2147483001;
         background: #111;
         color: #fff;
         border-radius: 20px;
@@ -104,10 +267,50 @@
         border: 1px solid #333;
       }
       #ff-panel.off { background: #333; }
+
+      #ff-manage-panel {
+        position: fixed;
+        bottom: 60px;
+        right: 20px;
+        z-index: 2147483001;
+        background: #111;
+        color: #fff;
+        border-radius: 12px;
+        padding: 12px 14px;
+        font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+        font-size: 12px;
+        box-shadow: 0 2px 8px rgba(0,0,0,.5);
+        border: 1px solid #333;
+        max-height: 300px;
+        overflow-y: auto;
+        min-width: 180px;
+      }
+      .ff-manage-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 10px;
+        padding: 4px 0;
+        border-bottom: 1px solid #222;
+      }
+      .ff-manage-row:last-child { border-bottom: none; }
+      .ff-manage-row button {
+        background: none;
+        border: none;
+        color: #999;
+        cursor: pointer;
+        font-size: 12px;
+      }
+      .ff-manage-row button:hover { color: #f55; }
+      #ff-manage-hint {
+        opacity: .55;
+        margin-top: 6px;
+        font-size: 10px;
+      }
     `);
 
     // Cover the page immediately if we're loading straight into a blackout page.
-    if (enabled && isBlackoutPage()) {
+    if (feedActive() && isBlackoutPage()) {
       document.documentElement.classList.add('ff-preblock');
     }
 
@@ -123,25 +326,38 @@
       return null;
     }
 
+    function pauseMediaIn(node) {
+      node.querySelectorAll('video').forEach((v) => {
+        try {
+          if (!v.paused) v.pause();
+          v.muted = true;
+        } catch (e) { /* ignore */ }
+      });
+    }
+
     function blockNode(node, username) {
-      if (node.classList.contains('ff-blocked')) return;
-      node.classList.add('ff-blocked');
-      const overlay = document.createElement('div');
-      overlay.className = 'ff-overlay';
-      overlay.innerHTML = `<div>\u{1F6AB} Blocked${username ? ' \u2014 @' + username : ''}</div>`;
-      if (username) {
-        const btn = document.createElement('button');
-        btn.textContent = 'Always show this account';
-        btn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          allowList.add(username);
-          saveList();
-          updatePanel();
-          unblockNode(node);
-        });
-        overlay.appendChild(btn);
+      if (!node.classList.contains('ff-blocked')) {
+        node.classList.add('ff-blocked');
+        const overlay = document.createElement('div');
+        overlay.className = 'ff-overlay';
+        overlay.innerHTML = `<div>\u{1F6AB} Blocked${username ? ' \u2014 @' + username : ''}</div>`;
+        if (username) {
+          const btn = document.createElement('button');
+          btn.textContent = 'Always show this account';
+          btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            allowList.add(username);
+            saveList();
+            updatePanel();
+            unblockNode(node);
+          });
+          overlay.appendChild(btn);
+        }
+        node.appendChild(overlay);
       }
-      node.appendChild(overlay);
+      // Always re-pause: new video elements can appear inside an
+      // already-blocked container (e.g. as reels lazy-load).
+      pauseMediaIn(node);
     }
 
     function unblockNode(node) {
@@ -187,7 +403,7 @@
     }
 
     function scan() {
-      if (!enabled || !isBlackoutPage()) {
+      if (!feedActive() || !isBlackoutPage()) {
         document.querySelectorAll('.ff-blocked').forEach(unblockNode);
       } else {
         document.querySelectorAll('article').forEach(processNode);
@@ -199,9 +415,12 @@
           processNode(wrap);
         });
         document.querySelectorAll('video').forEach(processVideo);
+        // Catch any video that snuck into an already-blocked container.
+        document.querySelectorAll('.ff-blocked').forEach(pauseMediaIn);
       }
       hideComments();
     }
+    const debouncedScan = makeDebouncer(scan, 100, 600);
 
     // Comments show up on post pages, the post modal, and permalink pages —
     // not just the feed/explore/reels blackout pages — so this runs on every
@@ -211,7 +430,7 @@
     const VIEW_REPLIES_SELECTOR = '._aswp';
 
     function hideComments() {
-      if (!enabled) {
+      if (!commentsActive()) {
         document.querySelectorAll('.ff-comment-hidden').forEach(el => el.classList.remove('ff-comment-hidden'));
         return;
       }
@@ -244,14 +463,81 @@
     }
 
     let panel, observer;
-    let timer;
+
+    function modeLabel() {
+      return BLOCK_MODES.find(m => m.id === blockMode)?.label || 'Block all';
+    }
 
     function updatePanel() {
       if (!panel) return;
       panel.textContent = enabled
-        ? `\u{1F6AB} Blackout: ON (${allowList.size} allowed)`
+        ? `\u{1F6AB} ${modeLabel()} (${allowList.size} allowed)`
         : '\u23F8 Blackout: OFF';
       panel.classList.toggle('off', !enabled);
+    }
+
+    function closeManagePanel() {
+      const mgr = document.getElementById('ff-manage-panel');
+      if (mgr) mgr.remove();
+    }
+
+    function showManagePanel() {
+      const existing = document.getElementById('ff-manage-panel');
+      if (existing) { existing.remove(); return; }
+
+      const mgr = document.createElement('div');
+      mgr.id = 'ff-manage-panel';
+
+      const title = document.createElement('div');
+      title.style.fontWeight = '600';
+      title.style.marginBottom = '6px';
+      title.textContent = `Allowed accounts (${allowList.size})`;
+      mgr.appendChild(title);
+
+      if (allowList.size === 0) {
+        const empty = document.createElement('div');
+        empty.style.opacity = '.6';
+        empty.textContent = 'None yet.';
+        mgr.appendChild(empty);
+      } else {
+        [...allowList].sort().forEach((name) => {
+          const row = document.createElement('div');
+          row.className = 'ff-manage-row';
+          const label = document.createElement('span');
+          label.textContent = `@${name}`;
+          const rm = document.createElement('button');
+          rm.textContent = '\u2715';
+          rm.title = 'Remove';
+          rm.addEventListener('click', (e) => {
+            e.stopPropagation();
+            allowList.delete(name);
+            saveList();
+            updatePanel();
+            reprocessAll();
+            showManagePanel(); // refresh contents
+          });
+          row.appendChild(label);
+          row.appendChild(rm);
+          mgr.appendChild(row);
+        });
+      }
+
+      const hint = document.createElement('div');
+      hint.id = 'ff-manage-hint';
+      hint.textContent = 'Double-click the panel to add someone.';
+      mgr.appendChild(hint);
+
+      document.body.appendChild(mgr);
+
+      // Close when clicking elsewhere.
+      setTimeout(() => {
+        document.addEventListener('click', function onDocClick(e) {
+          if (!mgr.contains(e.target) && e.target !== panel) {
+            mgr.remove();
+            document.removeEventListener('click', onDocClick);
+          }
+        });
+      }, 0);
     }
 
     function whenBodyReady(cb) {
@@ -261,14 +547,43 @@
       }).observe(document.documentElement, { childList: true, subtree: true });
     }
 
+    // Sync toggle, mode, and allow-list instantly across tabs.
+    if (typeof GM_addValueChangeListener === 'function') {
+      GM_addValueChangeListener(ENABLED_KEY, (_name, _old, newVal) => {
+        enabled = newVal;
+        updatePanel();
+        if (feedActive() && isBlackoutPage()) document.documentElement.classList.add('ff-preblock');
+        reprocessAll();
+        revealSoon();
+      });
+      GM_addValueChangeListener(LIST_KEY, (_name, _old, newVal) => {
+        allowList = new Set(newVal);
+        updatePanel();
+        reprocessAll();
+      });
+      GM_addValueChangeListener(MODE_KEY, (_name, _old, newVal) => {
+        blockMode = newVal;
+        modeFlags = computeModeFlags(newVal);
+        updatePanel();
+        if (feedActive() && isBlackoutPage()) document.documentElement.classList.add('ff-preblock');
+        reprocessAll();
+        revealSoon();
+      });
+    }
+
     whenBodyReady(function init() {
+      const controls = document.createElement('div');
+      controls.id = 'ff-controls';
+      controls.style.cssText = 'position:fixed;bottom:20px;right:20px;z-index:2147483001;display:flex;gap:8px;align-items:center;';
+
       panel = document.createElement('div');
       panel.id = 'ff-panel';
+      panel.title = 'Click: toggle \u00b7 Double-click: add account \u00b7 Right-click: manage list';
       panel.addEventListener('click', () => {
         enabled = !enabled;
         saveEnabled();
         updatePanel();
-        if (enabled && isBlackoutPage()) document.documentElement.classList.add('ff-preblock');
+        if (feedActive() && isBlackoutPage()) document.documentElement.classList.add('ff-preblock');
         reprocessAll();
         revealSoon();
       });
@@ -282,27 +597,69 @@
           reprocessAll();
         }
       });
-      document.body.appendChild(panel);
+      panel.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        showManagePanel();
+      });
+
+      const gear = document.createElement('div');
+      gear.id = 'ff-gear';
+      gear.textContent = '\u2699';
+      gear.title = 'Choose what to block';
+      gear.addEventListener('click', (e) => {
+        e.stopPropagation();
+        buildSettingsPanel({
+          currentMode: blockMode,
+          onChange: (newMode) => {
+            blockMode = newMode;
+            GM_setValue(MODE_KEY, newMode);
+            modeFlags = computeModeFlags(newMode);
+            updatePanel();
+            if (feedActive() && isBlackoutPage()) document.documentElement.classList.add('ff-preblock');
+            reprocessAll();
+            revealSoon();
+          },
+        });
+      });
+
+      controls.appendChild(panel);
+      controls.appendChild(gear);
+      document.body.appendChild(controls);
       updatePanel();
 
-      observer = new MutationObserver(() => {
-        clearTimeout(timer);
-        timer = setTimeout(scan, 100);
-      });
+      observer = new MutationObserver(debouncedScan);
       observer.observe(document.body, { childList: true, subtree: true });
 
       scan();
       revealSoon();
 
+      // Instant SPA-navigation detection via history hooks, instead of
+      // relying solely on a poll interval.
       let lastPath = location.pathname;
-      setInterval(() => {
-        if (location.pathname !== lastPath) {
-          lastPath = location.pathname;
-          if (enabled && isBlackoutPage()) document.documentElement.classList.add('ff-preblock');
-          reprocessAll();
-          revealSoon();
-        }
-      }, 300);
+      function onLocationChange() {
+        if (location.pathname === lastPath) return;
+        lastPath = location.pathname;
+        closeManagePanel();
+        if (feedActive() && isBlackoutPage()) document.documentElement.classList.add('ff-preblock');
+        reprocessAll();
+        revealSoon();
+      }
+      const _pushState = history.pushState;
+      const _replaceState = history.replaceState;
+      history.pushState = function (...args) {
+        const ret = _pushState.apply(this, args);
+        onLocationChange();
+        return ret;
+      };
+      history.replaceState = function (...args) {
+        const ret = _replaceState.apply(this, args);
+        onLocationChange();
+        return ret;
+      };
+      window.addEventListener('popstate', onLocationChange);
+      // Low-frequency safety net in case something navigates without
+      // going through history.pushState/replaceState.
+      setInterval(onLocationChange, 1000);
     });
   }
 
@@ -312,7 +669,11 @@
   if (isYT) {
     const YT_ENABLED_KEY = 'yt_blocker_enabled';
     let ytEnabled = GM_getValue(YT_ENABLED_KEY, true);
+    let blockMode = GM_getValue(MODE_KEY, 'all');
+    let modeFlags = computeModeFlags(blockMode);
     function saveYTEnabled() { GM_setValue(YT_ENABLED_KEY, ytEnabled); }
+    function shortsActive() { return ytEnabled && modeFlags.ytShorts; }
+    function ytCommentsActive() { return ytEnabled && modeFlags.ytComments; }
 
     GM_addStyle(`
       .yt-shorts-hidden, .yt-comments-hidden {
@@ -320,10 +681,6 @@
       }
 
       #yt-blocker-panel {
-        position: fixed;
-        bottom: 20px;
-        right: 20px;
-        z-index: 2147483001;
         background: #111;
         color: #fff;
         border-radius: 20px;
@@ -339,7 +696,7 @@
     `);
 
     function checkRedirect() {
-      if (ytEnabled && location.pathname.startsWith('/shorts/')) {
+      if (shortsActive() && location.pathname.startsWith('/shorts/')) {
         location.replace('https://www.youtube.com/');
       }
     }
@@ -384,9 +741,15 @@
       }
     }
 
-    function showAll() {
+    function showShorts() {
       document.querySelectorAll('.yt-shorts-hidden').forEach(el => el.classList.remove('yt-shorts-hidden'));
+    }
+    function showComments() {
       document.querySelectorAll('.yt-comments-hidden').forEach(el => el.classList.remove('yt-comments-hidden'));
+    }
+    function showAll() {
+      showShorts();
+      showComments();
     }
 
     function scanShorts() {
@@ -441,23 +804,49 @@
         showAll();
         return;
       }
-      scanShorts();
-      scanComments();
+      if (shortsActive()) scanShorts(); else showShorts();
+      if (ytCommentsActive()) scanComments(); else showComments();
     }
+    const debouncedScanYT = makeDebouncer(scanYT, 150, 800);
 
     let panel;
+    function modeLabel() {
+      return BLOCK_MODES.find(m => m.id === blockMode)?.label || 'Block all';
+    }
     function updatePanel() {
       if (!panel) return;
       panel.textContent = ytEnabled
-        ? '\u{1F6AB} Shorts+Comments: ON'
+        ? `\u{1F6AB} ${modeLabel()}`
         : '\u23F8 Shorts+Comments: OFF';
       panel.classList.toggle('off', !ytEnabled);
     }
 
+    if (typeof GM_addValueChangeListener === 'function') {
+      GM_addValueChangeListener(YT_ENABLED_KEY, (_name, _old, newVal) => {
+        ytEnabled = newVal;
+        updatePanel();
+        checkRedirect();
+        scanYT();
+      });
+      GM_addValueChangeListener(MODE_KEY, (_name, _old, newVal) => {
+        blockMode = newVal;
+        modeFlags = computeModeFlags(newVal);
+        updatePanel();
+        checkRedirect();
+        scanYT();
+      });
+    }
+
     function initPanel() {
       if (document.getElementById('yt-blocker-panel')) return;
+
+      const controls = document.createElement('div');
+      controls.id = 'yt-controls';
+      controls.style.cssText = 'position:fixed;bottom:20px;right:20px;z-index:2147483001;display:flex;gap:8px;align-items:center;';
+
       panel = document.createElement('div');
       panel.id = 'yt-blocker-panel';
+      panel.title = 'Click: toggle \u00b7 Gear: choose what to block';
       panel.addEventListener('click', () => {
         ytEnabled = !ytEnabled;
         saveYTEnabled();
@@ -465,17 +854,35 @@
         checkRedirect();
         scanYT();
       });
-      document.body.appendChild(panel);
+
+      const gear = document.createElement('div');
+      gear.id = 'yt-gear';
+      gear.textContent = '\u2699';
+      gear.title = 'Choose what to block';
+      gear.addEventListener('click', (e) => {
+        e.stopPropagation();
+        buildSettingsPanel({
+          currentMode: blockMode,
+          onChange: (newMode) => {
+            blockMode = newMode;
+            GM_setValue(MODE_KEY, newMode);
+            modeFlags = computeModeFlags(newMode);
+            updatePanel();
+            checkRedirect();
+            scanYT();
+          },
+        });
+      });
+
+      controls.appendChild(panel);
+      controls.appendChild(gear);
+      document.body.appendChild(controls);
       updatePanel();
     }
 
-    let ytTimer;
     function startYTObserver() {
       const target = document.documentElement;
-      const ytObserver = new MutationObserver(() => {
-        clearTimeout(ytTimer);
-        ytTimer = setTimeout(scanYT, 150);
-      });
+      const ytObserver = new MutationObserver(debouncedScanYT);
       ytObserver.observe(target, { childList: true, subtree: true });
       scanYT();
     }

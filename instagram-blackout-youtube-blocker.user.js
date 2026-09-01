@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Instagram Blackout (Feed/Explore/Reels) + YouTube Shorts & Comments Blocker
 // @namespace    https://tampermonkey.net/
-// @version      4.2
-// @description  Blocks Youtube Shorts, and Instagram Reels, also blocks Comments (for your peace of mind). With some customizable settings. Join my discord : https://discord.gg/TKT66C7Gu7
+// @version      6.0
+// @description  Instantly blacks out Instagram's home feed, Explore grid, and Reels tab on load (no flash of content). Only accounts on your allow-list show. Search results, profile pages, and DMs are untouched. Also blocks all YouTube Shorts and comments, with its own on/off toggle. A settings panel lets you choose to block everything, comments only, YouTube Shorts only, or Instagram only. Join my discord : https://discord.gg/TKT66C7Gu7
 // @author       Lvens
 // @match        https://www.instagram.com/*
 // @match        https://www.youtube.com/*
@@ -12,6 +12,27 @@
 // @grant        GM_addValueChangeListener
 // @run-at       document-start
 // ==/UserScript==
+
+// v6.0 — merged from two branches, plus fixes:
+// - Kept the whole-article blackout approach (blocks the entire <article>,
+//   not just the media element) since it sidesteps the "grabbed the avatar
+//   instead of the post" class of bug entirely, and CSS visibility
+//   inheritance means it correctly darkens content at any nesting depth.
+// - FIX: processVideo() used to run on every <video> on the page, including
+//   ones already inside an <article> that the article-level scan had
+//   already blacked out — producing a second, nested .ff-blocked box with
+//   its own overlay inside the first (visible glitch on video/Reel posts
+//   in the feed). It now skips videos already covered by an <article>.
+// - FIX: .ff-overlay's z-index was only 999, low enough that some of
+//   Instagram's own UI layers (hover controls, play buttons) could still
+//   render on top of it. Bumped to the same very-high z-index used
+//   elsewhere in this script so the overlay always wins.
+// - Restored "Block Reels in DMs" (present in an earlier version of this
+//   script, missing here).
+// - Comment hiding now also uses a structural fallback (a <ul> whose <li>
+//   rows each contain a username link + a <time datetime>) in addition to
+//   the known obfuscated class hooks, so it keeps working if Instagram
+//   rotates those class names again.
 
 (function () {
   'use strict';
@@ -46,6 +67,7 @@
      so the mode you pick on one site is remembered on the other.)
   =========================================================== */
   const MODE_KEY = 'ff_block_mode'; // 'all' | 'comments' | 'yt_shorts' | 'instagram'
+  const IG_DM_REELS_KEY = 'ff_dm_reels_enabled';
 
   const BLOCK_MODES = [
     { id: 'all', label: 'Block all', hint: 'Feed/Explore/Reels, Shorts, and comments everywhere' },
@@ -121,12 +143,26 @@
       opacity: .6;
       font-size: 10px;
       margin-top: 1px;
+      line-height: 1.35;
+    }
+    #global-settings-panel .gs-sep {
+      height: 1px;
+      background: #2a2a2a;
+      margin: 7px 0;
+    }
+    #global-settings-panel .gs-section {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      opacity: .5;
+      margin: 5px 0 2px;
     }
   `);
 
   // Generic mode-picker panel, shared by both the Instagram and YouTube
   // gear buttons (only one of which exists on any given page).
-  function buildSettingsPanel({ currentMode, onChange }) {
+  // `showInstagramExtras` adds the IG-only "Block Reels in DMs" toggle.
+  function buildSettingsPanel({ currentMode, onChange, showInstagramExtras = false }) {
     const existing = document.getElementById('global-settings-panel');
     if (existing) { existing.remove(); return; }
 
@@ -169,6 +205,36 @@
       panelEl.appendChild(row);
     });
 
+    if (showInstagramExtras) {
+      const sep = document.createElement('div');
+      sep.className = 'gs-sep';
+      panelEl.appendChild(sep);
+
+      const section = document.createElement('div');
+      section.className = 'gs-section';
+      section.textContent = 'Instagram Direct Messages';
+      panelEl.appendChild(section);
+
+      const dmRow = document.createElement('label');
+      dmRow.className = 'gs-row';
+      const dmToggle = document.createElement('input');
+      dmToggle.type = 'checkbox';
+      dmToggle.checked = GM_getValue(IG_DM_REELS_KEY, false);
+      dmToggle.addEventListener('change', () => GM_setValue(IG_DM_REELS_KEY, dmToggle.checked));
+      const dmTextWrap = document.createElement('div');
+      const dmStrong = document.createElement('div');
+      dmStrong.className = 'gs-label';
+      dmStrong.textContent = 'Block Reels in DMs';
+      const dmHint = document.createElement('div');
+      dmHint.className = 'gs-hint';
+      dmHint.textContent = 'Hide Reel media shared inside conversations. Off by default.';
+      dmTextWrap.appendChild(dmStrong);
+      dmTextWrap.appendChild(dmHint);
+      dmRow.appendChild(dmToggle);
+      dmRow.appendChild(dmTextWrap);
+      panelEl.appendChild(dmRow);
+    }
+
     document.body.appendChild(panelEl);
 
     setTimeout(() => {
@@ -192,6 +258,7 @@
     let enabled = GM_getValue(ENABLED_KEY, true);
     let blockMode = GM_getValue(MODE_KEY, 'all');
     let modeFlags = computeModeFlags(blockMode);
+    let dmReelsEnabled = GM_getValue(IG_DM_REELS_KEY, false);
 
     function saveList() { GM_setValue(LIST_KEY, [...allowList]); }
     function saveEnabled() { GM_setValue(ENABLED_KEY, enabled); }
@@ -204,6 +271,10 @@
       if (/^\/explore(\/|$)/.test(p)) return true;
       if (/^\/reels(\/|$)/.test(p)) return true;
       return false;
+    }
+
+    function isDMPage() {
+      return /^\/direct(\/|$)/.test(location.pathname);
     }
 
     // Styles injected immediately (document-start), before any content paints.
@@ -228,6 +299,9 @@
       .ff-comment-hidden {
         display: none !important;
       }
+      .ff-dm-reel-hidden {
+        display: none !important;
+      }
       .ff-overlay {
         position: absolute;
         inset: 0;
@@ -240,8 +314,12 @@
         font-family: -apple-system, BlinkMacSystemFont, sans-serif;
         font-size: 12px;
         text-align: center;
-        z-index: 999;
+        /* Very high z-index so this always wins over Instagram's own
+           in-post UI layers (hover controls, play buttons, etc.) — a
+           low value like 999 could still get covered by those. */
+        z-index: 2147482999;
         padding: 8px;
+        visibility: visible !important;
       }
       .ff-overlay button {
         background: #262626;
@@ -398,6 +476,15 @@
     function processVideo(video) {
       if (video.dataset.ffMediaChecked) return;
       video.dataset.ffMediaChecked = '1';
+      // FIX: feed videos are already inside an <article>, and the
+      // article-level scan below already blacks that whole article out.
+      // Without this check, this function would ALSO find a smaller
+      // container around just the video and block that separately,
+      // producing a second nested overlay box inside the first — a
+      // visible glitch on video/Reel posts in the feed. Only handle
+      // videos that live outside any <article> (Explore grid tiles, the
+      // standalone Reels tab), which the article scan can't see.
+      if (video.closest('article')) return;
       const container = findMediaContainer(video);
       processNode(container);
     }
@@ -419,6 +506,7 @@
         document.querySelectorAll('.ff-blocked').forEach(pauseMediaIn);
       }
       hideComments();
+      processDMReels();
     }
     const debouncedScan = makeDebouncer(scan, 100, 600);
 
@@ -428,6 +516,21 @@
     const COMMENT_LIST_SELECTOR = 'ul._a9ym';
     const LOAD_MORE_COMMENTS_SELECTOR = '._abl-';
     const VIEW_REPLIES_SELECTOR = '._aswp';
+
+    // Structural fallback: a comment list is a <ul> whose <li> rows each
+    // contain a username link plus a <time datetime> timestamp. That
+    // pattern survives Instagram rotating its obfuscated class names,
+    // unlike the fixed selectors above.
+    function looksLikeCommentList(ul) {
+      if (!ul || ul.tagName !== 'UL') return false;
+      const items = ul.querySelectorAll(':scope > li');
+      if (!items.length) return false;
+      let hits = 0;
+      items.forEach(li => {
+        if (li.querySelector('time[datetime]') && li.querySelector('a[href^="/"]')) hits++;
+      });
+      return hits / items.length >= 0.5;
+    }
 
     function hideComments() {
       if (!commentsActive()) {
@@ -442,6 +545,20 @@
       document.querySelectorAll(VIEW_REPLIES_SELECTOR).forEach(btn => {
         const li = btn.closest('li') || btn;
         li.classList.add('ff-comment-hidden');
+      });
+      document.querySelectorAll('ul').forEach(ul => {
+        if (looksLikeCommentList(ul)) ul.classList.add('ff-comment-hidden');
+      });
+    }
+
+    function processDMReels() {
+      if (!dmReelsEnabled || !isDMPage()) {
+        document.querySelectorAll('.ff-dm-reel-hidden').forEach(el => el.classList.remove('ff-dm-reel-hidden'));
+        return;
+      }
+      document.querySelectorAll('a[href^="/reel/"], video').forEach(el => {
+        const wrap = el.closest('article, div[role="presentation"], div[role="button"]') || el.parentElement || el;
+        wrap.classList.add('ff-dm-reel-hidden');
       });
     }
 
@@ -547,7 +664,7 @@
       }).observe(document.documentElement, { childList: true, subtree: true });
     }
 
-    // Sync toggle, mode, and allow-list instantly across tabs.
+    // Sync toggle, mode, allow-list, and DM-reels setting instantly across tabs.
     if (typeof GM_addValueChangeListener === 'function') {
       GM_addValueChangeListener(ENABLED_KEY, (_name, _old, newVal) => {
         enabled = newVal;
@@ -568,6 +685,10 @@
         if (feedActive() && isBlackoutPage()) document.documentElement.classList.add('ff-preblock');
         reprocessAll();
         revealSoon();
+      });
+      GM_addValueChangeListener(IG_DM_REELS_KEY, (_name, _old, newVal) => {
+        dmReelsEnabled = !!newVal;
+        processDMReels();
       });
     }
 
@@ -610,6 +731,7 @@
         e.stopPropagation();
         buildSettingsPanel({
           currentMode: blockMode,
+          showInstagramExtras: true,
           onChange: (newMode) => {
             blockMode = newMode;
             GM_setValue(MODE_KEY, newMode);

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Instagram Blackout (Feed/Explore/Reels) + YouTube Shorts & Comments Blocker
 // @namespace    https://tampermonkey.net/
-// @version      6.3
+// @version      6.4
 // @description  Instantly blacks out Instagram's home feed, Explore grid, and Reels tab on load (no flash of content). Only accounts on your allow-list show. Search results, profile pages, and DMs are untouched. Also blocks all YouTube Shorts and comments, with its own on/off toggle. A settings panel lets you choose to block everything, comments only, YouTube Shorts only, or Instagram only. If you turn blocking off, it automatically turns itself back on after 1 minute. Join my discord : https://discord.gg/TKT66C7Gu7
 // @author       Lvens
 // @match        https://www.instagram.com/*
@@ -83,6 +83,23 @@
 //   are always correct even if that re-scan step errors out.
 // - Both auto re-enable windows (Instagram and YouTube) are now 1 minute
 //   instead of 5.
+//
+// v6.4 — full settings panel, everything customizable:
+// - The gear panel now has an "Auto re-enable" section: a checkbox to turn
+//   the whole 1-minute-safety-net behavior on/off, and (when it's on) a
+//   dropdown to pick how long blocking can stay off before it flips back
+//   on (30s / 1 / 2 / 5 / 10 / 15 / 30 / 60 min). This one setting drives
+//   both the Instagram blackout and the YouTube Shorts/Comments blocker —
+//   it's stored once and shared, same as the block-mode setting already
+//   was.
+// - Turning auto re-enable off stops the timer from ever firing, on both
+//   sites, until you switch it back on — blocking then just stays off
+//   until you toggle it yourself.
+// - All of it is synced live across open tabs via GM_addValueChangeListener,
+//   same mechanism as the existing mode/allow-list sync.
+// - "Block Reels in DMs" (Instagram-only) stays where it was, now grouped
+//   under its own "Instagram Direct Messages" section alongside the new
+//   "Auto Re-enable" section for a single, complete settings surface.
 
 (function () {
   'use strict';
@@ -118,6 +135,17 @@
   =========================================================== */
   const MODE_KEY = 'ff_block_mode'; // 'all' | 'comments' | 'yt_shorts' | 'instagram'
   const IG_DM_REELS_KEY = 'ff_dm_reels_enabled';
+
+  // Auto re-enable: one shared on/off + duration setting, used by both the
+  // Instagram blackout toggle and the YouTube Shorts/Comments toggle.
+  const AUTO_REENABLE_ENABLED_KEY = 'ff_auto_reenable_enabled';
+  const AUTO_REENABLE_MINUTES_KEY = 'ff_auto_reenable_minutes';
+  // Values are in minutes; 0.5 = 30 seconds. Shown in the dropdown in order.
+  const AUTO_REENABLE_OPTIONS = [0.5, 1, 2, 5, 10, 15, 30, 60];
+
+  function autoReenableLabel(minutes) {
+    return minutes < 1 ? `${Math.round(minutes * 60)} sec` : `${minutes} min`;
+  }
 
   const BLOCK_MODES = [
     { id: 'all', label: 'Block all', hint: 'Feed/Explore/Reels, Shorts, and comments everywhere' },
@@ -207,6 +235,25 @@
       opacity: .5;
       margin: 5px 0 2px;
     }
+    #global-settings-panel .gs-subrow {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 4px 0 2px 24px;
+    }
+    #global-settings-panel .gs-subrow select {
+      background: #1c1c1c;
+      color: #fff;
+      border: 1px solid #333;
+      border-radius: 6px;
+      padding: 3px 6px;
+      font-size: 11px;
+    }
+    #global-settings-panel .gs-subrow.disabled {
+      opacity: .35;
+      pointer-events: none;
+    }
   `);
 
   // Generic mode-picker panel, shared by both the Instagram and YouTube
@@ -221,8 +268,13 @@
 
     const title = document.createElement('div');
     title.className = 'gs-title';
-    title.textContent = 'What should I block?';
+    title.textContent = 'Settings';
     panelEl.appendChild(title);
+
+    const modeSection = document.createElement('div');
+    modeSection.className = 'gs-section';
+    modeSection.textContent = 'What to block';
+    panelEl.appendChild(modeSection);
 
     BLOCK_MODES.forEach(({ id, label, hint }) => {
       const row = document.createElement('label');
@@ -255,15 +307,69 @@
       panelEl.appendChild(row);
     });
 
-    if (showInstagramExtras) {
+    // --- Auto re-enable (shared setting, shown on both IG and YT gears) ---
+    {
       const sep = document.createElement('div');
       sep.className = 'gs-sep';
       panelEl.appendChild(sep);
 
       const section = document.createElement('div');
       section.className = 'gs-section';
-      section.textContent = 'Instagram Direct Messages';
+      section.textContent = 'Auto Re-enable';
       panelEl.appendChild(section);
+
+      const arRow = document.createElement('label');
+      arRow.className = 'gs-row';
+      const arToggle = document.createElement('input');
+      arToggle.type = 'checkbox';
+      arToggle.checked = GM_getValue(AUTO_REENABLE_ENABLED_KEY, true);
+      const arTextWrap = document.createElement('div');
+      const arStrong = document.createElement('div');
+      arStrong.className = 'gs-label';
+      arStrong.textContent = 'Auto-flip blocking back on';
+      const arHint = document.createElement('div');
+      arHint.className = 'gs-hint';
+      arHint.textContent = 'If you turn blocking off, automatically turn it back on after a delay.';
+      arTextWrap.appendChild(arStrong);
+      arTextWrap.appendChild(arHint);
+      arRow.appendChild(arToggle);
+      arRow.appendChild(arTextWrap);
+      panelEl.appendChild(arRow);
+
+      const durRow = document.createElement('div');
+      durRow.className = 'gs-subrow' + (arToggle.checked ? '' : ' disabled');
+      const durLabel = document.createElement('span');
+      durLabel.textContent = 'Delay';
+      const durSelect = document.createElement('select');
+      AUTO_REENABLE_OPTIONS.forEach((mins) => {
+        const opt = document.createElement('option');
+        opt.value = String(mins);
+        opt.textContent = autoReenableLabel(mins);
+        durSelect.appendChild(opt);
+      });
+      durSelect.value = String(GM_getValue(AUTO_REENABLE_MINUTES_KEY, 1));
+      durRow.appendChild(durLabel);
+      durRow.appendChild(durSelect);
+      panelEl.appendChild(durRow);
+
+      arToggle.addEventListener('change', () => {
+        GM_setValue(AUTO_REENABLE_ENABLED_KEY, arToggle.checked);
+        durRow.classList.toggle('disabled', !arToggle.checked);
+      });
+      durSelect.addEventListener('change', () => {
+        GM_setValue(AUTO_REENABLE_MINUTES_KEY, parseFloat(durSelect.value));
+      });
+    }
+
+    if (showInstagramExtras) {
+      const sep2 = document.createElement('div');
+      sep2.className = 'gs-sep';
+      panelEl.appendChild(sep2);
+
+      const section2 = document.createElement('div');
+      section2.className = 'gs-section';
+      section2.textContent = 'Instagram Direct Messages';
+      panelEl.appendChild(section2);
 
       const dmRow = document.createElement('label');
       dmRow.className = 'gs-row';
@@ -304,8 +410,9 @@
     const LIST_KEY = 'ff_allowlist';
     const ENABLED_KEY = 'ff_enabled';
 
-    // v6.3: auto re-enable the blackout 1 minute after it's turned off.
-    const AUTO_REENABLE_MS = 1 * 60 * 1000;
+    // v6.4: auto re-enable delay/on-off is now a shared, customizable
+    // setting (see AUTO_REENABLE_ENABLED_KEY / AUTO_REENABLE_MINUTES_KEY)
+    // instead of a hardcoded 1-minute constant.
     const DISABLED_AT_KEY = 'ff_disabled_at';
 
     let allowList = new Set(GM_getValue(LIST_KEY, []));
@@ -314,6 +421,8 @@
     let blockMode = GM_getValue(MODE_KEY, 'all');
     let modeFlags = computeModeFlags(blockMode);
     let dmReelsEnabled = GM_getValue(IG_DM_REELS_KEY, false);
+    let autoReenableEnabled = GM_getValue(AUTO_REENABLE_ENABLED_KEY, true);
+    let autoReenableMinutes = GM_getValue(AUTO_REENABLE_MINUTES_KEY, 1);
 
     function saveList() { GM_setValue(LIST_KEY, [...allowList]); }
     function saveEnabled() {
@@ -692,8 +801,8 @@
     // correctly shows "on" and stored state is already correct, instead
     // of silently staying stuck showing "Blackout: OFF".
     function checkAutoReenable() {
-      if (enabled || !disabledAt) return;
-      if (Date.now() - disabledAt >= AUTO_REENABLE_MS) {
+      if (enabled || !disabledAt || !autoReenableEnabled) return;
+      if (Date.now() - disabledAt >= autoReenableMinutes * 60 * 1000) {
         enabled = true;
         saveEnabled();
         updatePanel();
@@ -808,6 +917,12 @@
         dmReelsEnabled = !!newVal;
         processDMReels();
       });
+      GM_addValueChangeListener(AUTO_REENABLE_ENABLED_KEY, (_name, _old, newVal) => {
+        autoReenableEnabled = !!newVal;
+      });
+      GM_addValueChangeListener(AUTO_REENABLE_MINUTES_KEY, (_name, _old, newVal) => {
+        autoReenableMinutes = newVal;
+      });
     }
 
     whenBodyReady(function init() {
@@ -844,7 +959,7 @@
       const gear = document.createElement('div');
       gear.id = 'ff-gear';
       gear.textContent = '\u2699';
-      gear.title = 'Choose what to block';
+      gear.title = 'Settings (what to block, auto re-enable, etc.)';
       gear.addEventListener('click', (e) => {
         e.stopPropagation();
         buildSettingsPanel({
@@ -923,14 +1038,16 @@
   =========================================================== */
   if (isYT) {
     const YT_ENABLED_KEY = 'yt_blocker_enabled';
-    // v6.3: auto re-enable 1 minute after being switched off.
-    const YT_AUTO_REENABLE_MS = 1 * 60 * 1000;
+    // v6.4: auto re-enable on-off/delay is now the shared, customizable
+    // setting (see AUTO_REENABLE_ENABLED_KEY / AUTO_REENABLE_MINUTES_KEY).
     const YT_DISABLED_AT_KEY = 'yt_blocker_disabled_at';
 
     let ytEnabled = GM_getValue(YT_ENABLED_KEY, true);
     let ytDisabledAt = GM_getValue(YT_DISABLED_AT_KEY, null);
     let blockMode = GM_getValue(MODE_KEY, 'all');
     let modeFlags = computeModeFlags(blockMode);
+    let autoReenableEnabled = GM_getValue(AUTO_REENABLE_ENABLED_KEY, true);
+    let autoReenableMinutes = GM_getValue(AUTO_REENABLE_MINUTES_KEY, 1);
     function saveYTEnabled() {
       GM_setValue(YT_ENABLED_KEY, ytEnabled);
       ytDisabledAt = ytEnabled ? null : Date.now();
@@ -1091,8 +1208,8 @@
     // the flag and repaints the panel BEFORE the DOM refresh, which is
     // now wrapped in try/catch so it can't leave the toggle stuck.
     function checkYTAutoReenable() {
-      if (ytEnabled || !ytDisabledAt) return;
-      if (Date.now() - ytDisabledAt >= YT_AUTO_REENABLE_MS) {
+      if (ytEnabled || !ytDisabledAt || !autoReenableEnabled) return;
+      if (Date.now() - ytDisabledAt >= autoReenableMinutes * 60 * 1000) {
         ytEnabled = true;
         saveYTEnabled();
         updatePanel();
@@ -1114,6 +1231,12 @@
       });
       GM_addValueChangeListener(YT_DISABLED_AT_KEY, (_name, _old, newVal) => {
         ytDisabledAt = newVal;
+      });
+      GM_addValueChangeListener(AUTO_REENABLE_ENABLED_KEY, (_name, _old, newVal) => {
+        autoReenableEnabled = !!newVal;
+      });
+      GM_addValueChangeListener(AUTO_REENABLE_MINUTES_KEY, (_name, _old, newVal) => {
+        autoReenableMinutes = newVal;
       });
       GM_addValueChangeListener(MODE_KEY, (_name, _old, newVal) => {
         blockMode = newVal;
@@ -1145,7 +1268,7 @@
       const gear = document.createElement('div');
       gear.id = 'yt-gear';
       gear.textContent = '\u2699';
-      gear.title = 'Choose what to block';
+      gear.title = 'Settings (what to block, auto re-enable, etc.)';
       gear.addEventListener('click', (e) => {
         e.stopPropagation();
         buildSettingsPanel({

@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Instagram Blackout (Feed/Explore/Reels) + YouTube Shorts & Comments Blocker
 // @namespace    https://tampermonkey.net/
-// @version      6.1
-// @description  Instantly blacks out Instagram's home feed, Explore grid, and Reels tab on load (no flash of content). Only accounts on your allow-list show. Search results, profile pages, and DMs are untouched. Also blocks all YouTube Shorts and comments, with its own on/off toggle. A settings panel lets you choose to block everything, comments only, YouTube Shorts only, or Instagram only. Join my discord : https://discord.gg/TKT66C7Gu7
+// @version      6.3
+// @description  Instantly blacks out Instagram's home feed, Explore grid, and Reels tab on load (no flash of content). Only accounts on your allow-list show. Search results, profile pages, and DMs are untouched. Also blocks all YouTube Shorts and comments, with its own on/off toggle. A settings panel lets you choose to block everything, comments only, YouTube Shorts only, or Instagram only. If you turn blocking off, it automatically turns itself back on after 1 minute. Join my discord : https://discord.gg/TKT66C7Gu7
 // @author       Lvens
 // @match        https://www.instagram.com/*
 // @match        https://www.youtube.com/*
@@ -54,6 +54,35 @@
 //   the wrong element (e.g. a carousel control) instead of a comments
 //   button. Comment hiding now relies on the exact comment-list selector
 //   plus the structural fallback only.
+//
+// v6.2 — auto re-enable after 5 minutes off:
+// - Both the Instagram blackout toggle and the YouTube Shorts/Comments
+//   toggle now record a timestamp the moment you switch them off. Once
+//   5 minutes have passed, they flip themselves back on automatically —
+//   no need to remember to re-enable manually.
+// - The timestamp is stored via GM_setValue (not just a JS setTimeout),
+//   so it survives page reloads and SPA navigation: closing the tab and
+//   reopening it a few minutes later still auto-reactivates on schedule
+//   instead of resetting a fresh 5-minute window.
+// - The off-state check runs on a 1-second interval on both sites, and
+//   the stored "disabled at" timestamp is synced across open tabs the
+//   same way the enabled flag already was.
+//
+// v6.3 — fixes Instagram's auto re-enable getting stuck on "Blackout: OFF",
+// and shortens the auto re-enable window from 5 minutes to 1 minute:
+// - Instagram's re-enable check used to run bundled inside the same
+//   once-a-second interval tick as the SPA navigation watcher, right
+//   before a DOM-heavy re-scan of the (very volatile, constantly
+//   re-rendering) Instagram page. If anything in that scan threw, that
+//   tick could bail out silently — and if it kept throwing, the toggle
+//   could be left showing "Blackout: OFF" indefinitely even though the
+//   1-minute window had long since passed. The re-enable check now runs
+//   on its own dedicated interval, flips + saves the `enabled` flag and
+//   repaints the on-screen panel FIRST, and only THEN does the heavier
+//   DOM re-scan — wrapped in try/catch — so the panel and stored state
+//   are always correct even if that re-scan step errors out.
+// - Both auto re-enable windows (Instagram and YouTube) are now 1 minute
+//   instead of 5.
 
 (function () {
   'use strict';
@@ -275,14 +304,27 @@
     const LIST_KEY = 'ff_allowlist';
     const ENABLED_KEY = 'ff_enabled';
 
+    // v6.3: auto re-enable the blackout 1 minute after it's turned off.
+    const AUTO_REENABLE_MS = 1 * 60 * 1000;
+    const DISABLED_AT_KEY = 'ff_disabled_at';
+
     let allowList = new Set(GM_getValue(LIST_KEY, []));
     let enabled = GM_getValue(ENABLED_KEY, true);
+    let disabledAt = GM_getValue(DISABLED_AT_KEY, null);
     let blockMode = GM_getValue(MODE_KEY, 'all');
     let modeFlags = computeModeFlags(blockMode);
     let dmReelsEnabled = GM_getValue(IG_DM_REELS_KEY, false);
 
     function saveList() { GM_setValue(LIST_KEY, [...allowList]); }
-    function saveEnabled() { GM_setValue(ENABLED_KEY, enabled); }
+    function saveEnabled() {
+      GM_setValue(ENABLED_KEY, enabled);
+      // Track (or clear) when the toggle was switched off, so the
+      // 1-minute auto re-enable timer survives reloads/navigation
+      // instead of resetting to a fresh window every time the page
+      // is revisited.
+      disabledAt = enabled ? null : Date.now();
+      GM_setValue(DISABLED_AT_KEY, disabledAt);
+    }
     function feedActive() { return enabled && modeFlags.igFeed; }
     function commentsActive() { return enabled && modeFlags.igComments; }
 
@@ -641,6 +683,30 @@
       panel.classList.toggle('off', !enabled);
     }
 
+    // v6.3: if the blackout has been off for 1+ minute, flip it back on.
+    // Runs on its own dedicated interval (see init() below) rather than
+    // being bundled into the SPA-navigation tick, and now flips + saves
+    // the flag and repaints the panel BEFORE doing any DOM re-scanning —
+    // so even if reprocessAll()/scan() throws while walking Instagram's
+    // (very volatile, constantly re-rendering) DOM, the toggle still
+    // correctly shows "on" and stored state is already correct, instead
+    // of silently staying stuck showing "Blackout: OFF".
+    function checkAutoReenable() {
+      if (enabled || !disabledAt) return;
+      if (Date.now() - disabledAt >= AUTO_REENABLE_MS) {
+        enabled = true;
+        saveEnabled();
+        updatePanel();
+        try {
+          if (feedActive() && isBlackoutPage()) document.documentElement.classList.add('ff-preblock');
+          reprocessAll();
+          revealSoon();
+        } catch (e) {
+          console.error('[IG blocker] re-enable DOM refresh failed; will catch up on the next scan/mutation', e);
+        }
+      }
+    }
+
     function closeManagePanel() {
       const mgr = document.getElementById('ff-manage-panel');
       if (mgr) mgr.remove();
@@ -712,7 +778,8 @@
       }).observe(document.documentElement, { childList: true, subtree: true });
     }
 
-    // Sync toggle, mode, allow-list, and DM-reels setting instantly across tabs.
+    // Sync toggle, mode, allow-list, disabled-at timestamp, and DM-reels
+    // setting instantly across tabs.
     if (typeof GM_addValueChangeListener === 'function') {
       GM_addValueChangeListener(ENABLED_KEY, (_name, _old, newVal) => {
         enabled = newVal;
@@ -720,6 +787,9 @@
         if (feedActive() && isBlackoutPage()) document.documentElement.classList.add('ff-preblock');
         reprocessAll();
         revealSoon();
+      });
+      GM_addValueChangeListener(DISABLED_AT_KEY, (_name, _old, newVal) => {
+        disabledAt = newVal;
       });
       GM_addValueChangeListener(LIST_KEY, (_name, _old, newVal) => {
         allowList = new Set(newVal);
@@ -800,6 +870,11 @@
       observer = new MutationObserver(debouncedScan);
       observer.observe(document.body, { childList: true, subtree: true });
 
+      // v6.3: catch the case where the script itself was reloaded (e.g.
+      // tab reopened) after the 1-minute window already elapsed while it
+      // wasn't running.
+      checkAutoReenable();
+
       scan();
       revealSoon();
 
@@ -829,7 +904,17 @@
       window.addEventListener('popstate', onLocationChange);
       // Low-frequency safety net in case something navigates without
       // going through history.pushState/replaceState.
-      setInterval(onLocationChange, 1000);
+      setInterval(() => {
+        try {
+          onLocationChange();
+        } catch (e) {
+          console.error('[IG blocker] SPA nav check failed', e);
+        }
+      }, 1000);
+      // v6.3: the 1-minute auto re-enable check now runs on its own
+      // dedicated interval, completely independent of the nav-watcher
+      // tick above, so a failure in one can never suppress the other.
+      setInterval(checkAutoReenable, 1000);
     });
   }
 
@@ -838,10 +923,19 @@
   =========================================================== */
   if (isYT) {
     const YT_ENABLED_KEY = 'yt_blocker_enabled';
+    // v6.3: auto re-enable 1 minute after being switched off.
+    const YT_AUTO_REENABLE_MS = 1 * 60 * 1000;
+    const YT_DISABLED_AT_KEY = 'yt_blocker_disabled_at';
+
     let ytEnabled = GM_getValue(YT_ENABLED_KEY, true);
+    let ytDisabledAt = GM_getValue(YT_DISABLED_AT_KEY, null);
     let blockMode = GM_getValue(MODE_KEY, 'all');
     let modeFlags = computeModeFlags(blockMode);
-    function saveYTEnabled() { GM_setValue(YT_ENABLED_KEY, ytEnabled); }
+    function saveYTEnabled() {
+      GM_setValue(YT_ENABLED_KEY, ytEnabled);
+      ytDisabledAt = ytEnabled ? null : Date.now();
+      GM_setValue(YT_DISABLED_AT_KEY, ytDisabledAt);
+    }
     function shortsActive() { return ytEnabled && modeFlags.ytShorts; }
     function ytCommentsActive() { return ytEnabled && modeFlags.ytComments; }
 
@@ -991,12 +1085,35 @@
       panel.classList.toggle('off', !ytEnabled);
     }
 
+    // v6.3: if Shorts/Comments blocking has been off for 1+ minute, flip
+    // it back on. Runs on its own dedicated interval (see startYTObserver
+    // below), and — same hardening as the Instagram side — flips + saves
+    // the flag and repaints the panel BEFORE the DOM refresh, which is
+    // now wrapped in try/catch so it can't leave the toggle stuck.
+    function checkYTAutoReenable() {
+      if (ytEnabled || !ytDisabledAt) return;
+      if (Date.now() - ytDisabledAt >= YT_AUTO_REENABLE_MS) {
+        ytEnabled = true;
+        saveYTEnabled();
+        updatePanel();
+        try {
+          checkRedirect();
+          scanYT();
+        } catch (e) {
+          console.error('[YT blocker] re-enable DOM refresh failed; will catch up on the next scan/mutation', e);
+        }
+      }
+    }
+
     if (typeof GM_addValueChangeListener === 'function') {
       GM_addValueChangeListener(YT_ENABLED_KEY, (_name, _old, newVal) => {
         ytEnabled = newVal;
         updatePanel();
         checkRedirect();
         scanYT();
+      });
+      GM_addValueChangeListener(YT_DISABLED_AT_KEY, (_name, _old, newVal) => {
+        ytDisabledAt = newVal;
       });
       GM_addValueChangeListener(MODE_KEY, (_name, _old, newVal) => {
         blockMode = newVal;
@@ -1054,6 +1171,13 @@
       const target = document.documentElement;
       const ytObserver = new MutationObserver(debouncedScanYT);
       ytObserver.observe(target, { childList: true, subtree: true });
+
+      // v6.3: catch the case where the tab was reopened after the
+      // 1-minute window already elapsed while nothing was running, then
+      // keep polling every second so it still fires with no DOM activity.
+      checkYTAutoReenable();
+      setInterval(checkYTAutoReenable, 1000);
+
       scanYT();
     }
 
